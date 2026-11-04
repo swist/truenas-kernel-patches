@@ -1,14 +1,14 @@
 # truenas-kernel-patches
 
-Intel **BE200** (Wi-Fi 7, `8086:272b`) support for TrueNAS. A pipeline
+Intel **AX211**, **BE200** and **BE201** Wi-Fi support for TrueNAS (nothing else). A pipeline
 rebuilds the TrueNAS kernel with Wi-Fi enabled for each new TrueNAS release,
 and an on-NAS tool installs that kernel into the boot environment you will
 boot next.
 
 ## What's actually wrong on stock TrueNAS
 
-The BE200 driver is **already in every TrueNAS kernel** (6.6, 6.12 and 6.18
-lines all contain the `iwlwifi` BE200 PCI IDs). TrueNAS turns it off on
+The driver for all three cards is **already in every TrueNAS kernel** (checked
+the 6.12 and 6.18 lines). TrueNAS turns it off on
 purpose in `scripts/package/truenas/truenas.config`:
 
 ```
@@ -24,7 +24,7 @@ and the image ships no iwlwifi firmware, no regulatory database and no
 |---|---|
 | Re-enable cfg80211 / mac80211 / iwlwifi (MVM + MLD op-modes) | `config/wifi.config` |
 | Driver backports, if a future one is ever needed | `patches/linux/` (empty today) |
-| BE200 firmware (`iwlwifi-gl-*`) from linux-firmware | packaged by `scripts/build.sh` |
+| Firmware for exactly these cards (AX211 `*-gf-a0`, BE200 `gl-c0-fm-c0`, BE201 `*-fm-c0`), 61 of ~400 iwlwifi files | packaged by `scripts/build.sh` |
 | `wireless-regdb`, `iw`, `wpasupplicant` | Debian packages, bundled |
 
 Merged in TrueNAS's own order, the fragment changes **only** these
@@ -139,6 +139,10 @@ untouched. Pick the previous entry in the GRUB menu, or run
 install also takes a `truenas-wifi-pre-*` snapshot of the target BE first.
 
 ## Caveats
+
+- AX211 and BE201 are CNVi modules: they only work in boards with a matching
+  Intel chipset (AX211: 12th-gen Core or newer; BE201: Meteor Lake or newer).
+  BE200 is a normal M.2 PCIe card and works in any board.
 
 - Unsupported by iXsystems. Debug reports from a modified kernel may be
   rejected, and TrueNAS may report the root filesystem as modified.

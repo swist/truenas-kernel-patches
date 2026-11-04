@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# truenas-wifi - keep a Wi-Fi (Intel BE200) enabled kernel on TrueNAS.
+# truenas-wifi - keep a Wi-Fi (Intel AX211 / BE200 / BE201) enabled kernel on TrueNAS.
 #
 # Lives on a pool (e.g. /mnt/tank/truenas-wifi/) so it survives TrueNAS updates.
 #

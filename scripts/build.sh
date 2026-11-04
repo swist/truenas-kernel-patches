@@ -5,7 +5,7 @@
 #   * OpenZFS + SCST kernel modules rebuilt against that kernel (TrueNAS's
 #     kernel has CONFIG_MODVERSIONS off and enabling CFG80211 changes
 #     struct net_device, so stock out-of-tree modules must not be reused)
-#   * iwlwifi BE200 firmware, wireless-regdb, iw, wpa_supplicant
+#   * iwlwifi firmware for AX211 / BE200 / BE201 only, wireless-regdb, iw, wpa_supplicant
 #
 # Usage (as root, inside a Debian container matching the release, see
 # config/releases.conf):
@@ -70,14 +70,17 @@ verify_config() {
     for opt in CONFIG_WIRELESS=y CONFIG_WLAN=y CONFIG_CFG80211=m CONFIG_MAC80211=m CONFIG_IWLWIFI=m; do
         grep -qx "$opt" "$cfg" || { echo "missing $opt" >&2; bad=1; }
     done
-    # BE200 is driven by iwlmld on kernels that have it, iwlmvm before that.
+    # AX211 always uses iwlmvm; BE200/BE201 use iwlmld on kernels that have it.
     if grep -q '^config IWLMLD' "$src/drivers/net/wireless/intel/iwlwifi/Kconfig"; then
         grep -qx CONFIG_IWLMLD=m "$cfg" || { echo "missing CONFIG_IWLMLD=m" >&2; bad=1; }
     else
         grep -qx CONFIG_IWLMVM=m "$cfg" || { echo "missing CONFIG_IWLMVM=m" >&2; bad=1; }
     fi
-    grep -qi 'IWL_PCI_DEVICE(0x272b' "$src/drivers/net/wireless/intel/iwlwifi/pcie/drv.c" \
-        || { echo "iwlwifi in this tree has no BE200 (8086:272b) PCI ID - add a backport under patches/linux/" >&2; bad=1; }
+    local card
+    for card in "AX211" "BE200" "BE201"; do
+        grep -rqE "Wi-Fi [67]E? $card " "$src/drivers/net/wireless/intel/iwlwifi/cfg/" \
+            || { echo "iwlwifi in this tree does not know the $card - add a backport under patches/linux/" >&2; bad=1; }
+    done
     [ $bad = 0 ] || die "kernel config verification failed"
     log "kernel config OK: $(grep -E '^CONFIG_(CFG80211|MAC80211|IWLWIFI|IWLMVM|IWLMLD)=' "$cfg" | tr '\n' ' ')"
 }
@@ -94,7 +97,7 @@ build_kernel() {
     ver="${orig}+wifi${BUNDLE_REV}"
     {
         printf '%s (%s) sid; urgency=low\n\n' "$name" "$ver"
-        printf '  * Re-enable Wi-Fi (cfg80211/mac80211/iwlwifi) for Intel BE200.\n\n'
+        printf '  * Re-enable Wi-Fi (cfg80211/mac80211/iwlwifi) for Intel AX211/BE200/BE201.\n\n'
         printf ' -- truenas-kernel-patches <noreply@localhost>  %s\n\n' "$(date -R)"
         cat "$tn/changelog"
     } > "$tn/changelog.new"
@@ -171,19 +174,26 @@ build_firmware_deb() {
     local fwver; fwver=$(cd "$d" && git log -1 --format=%cd --date=format:%Y%m%d)
     mkdir -p "$stage"
     (cd "$d" && ./copy-firmware.sh "$stage") >/dev/null
-    # BE200 = "gl" MAC + "fm" RF. Keep files and symlinks, wherever linux-firmware puts them.
+    # iwlwifi firmware is named <MAC>-<RF>. Keep files and symlinks, wherever linux-firmware puts them.
+    #   AX211 (CNVi):    RF gf-a0, MAC so (ADL/RPL), ma (MTL), bz (ARL/LNL), sc (PTL)
+    #   BE200 (M.2):     gl-c0-fm-c0
+    #   BE201 (CNVi):    RF fm-c0, MAC bz (MTL/ARL/LNL), sc (PTL)
+    # Deliberately excluded: ty-a0-gf-a0 (AX210) and every other Intel card.
     mkdir -p "$pkg/DEBIAN" "$pkg/usr/lib/firmware"
-    (cd "$stage" && find . \( -name 'iwlwifi-gl-*' -o -name 'iwlwifi-*fm-c0*' -o -name 'iwlwifi-*gl*.pnvm' \) -print0 \
+    (cd "$stage" && find . \( -name 'iwlwifi-so-a0-gf-a0*' -o -name 'iwlwifi-ma-b0-gf-a0*' \
+                              -o -name 'iwlwifi-bz-b0-gf-a0*' -o -name 'iwlwifi-sc-a0-gf-a0*' \
+                              -o -name 'iwlwifi-gl-c0-fm-c0*' -o -name 'iwlwifi-bz-b0-fm-c0*' \
+                              -o -name 'iwlwifi-sc-a0-fm-c0*' \) -print0 \
         | xargs -0 -r cp -a --parents -t "$pkg/usr/lib/firmware")
-    [ -n "$(find "$pkg/usr/lib/firmware" -name '*.ucode' | head -1)" ] || die "no BE200 firmware found in linux-firmware"
+    [ -n "$(find "$pkg/usr/lib/firmware" -name '*.ucode' | head -1)" ] || die "no AX211/BE200/BE201 firmware found in linux-firmware"
     cat > "$pkg/DEBIAN/control" <<EOF
-Package: truenas-wifi-firmware-iwlwifi-be200
+Package: truenas-wifi-firmware-iwlwifi
 Version: ${fwver}
 Architecture: all
 Maintainer: truenas-kernel-patches <noreply@localhost>
-Description: Intel BE200 (iwlwifi gl/fm) firmware from linux-firmware ${fwver}
+Description: Intel AX211/BE200/BE201 iwlwifi firmware from linux-firmware ${fwver}
 EOF
-    dpkg-deb --root-owner-group -b "$pkg" "$out/truenas-wifi-firmware-iwlwifi-be200_${fwver}_all.deb" >&2
+    dpkg-deb --root-owner-group -b "$pkg" "$out/truenas-wifi-firmware-iwlwifi_${fwver}_all.deb" >&2
 }
 
 download_userspace() {
