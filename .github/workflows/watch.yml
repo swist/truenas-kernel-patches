@@ -1,0 +1,59 @@
+name: watch upstream
+
+# Polls truenas/linux, truenas/zfs and truenas/scst for new TrueNAS release
+# tags and builds a Wi-Fi bundle for each one. A push that changes the patch
+# set or config rebuilds the newest release of every tracked line as rN+1.
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  push:
+    branches: [main, master]
+    paths: ["config/**", "patches/**", "scripts/**"]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "new = only unbuilt tags, latest = rebuild newest tag of each line"
+        type: choice
+        options: [new, latest]
+        default: new
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: watch
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+      any: ${{ steps.find.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mode=new
+          if [ "${{ github.event_name }}" = push ] || [ "${{ inputs.mode }}" = latest ]; then mode=--latest; fi
+          m=$(scripts/find-new-releases.sh $mode)
+          echo "$m"
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+          echo "any=$(jq '.include | length > 0' <<<"$m")" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.any == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.detect.outputs.matrix) }}
+    uses: ./.github/workflows/build.yml
+    with:
+      tag: ${{ matrix.tag }}
+      debian: ${{ matrix.debian }}
+      rev: ${{ matrix.rev }}
+    secrets: inherit

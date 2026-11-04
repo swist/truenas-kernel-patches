@@ -1,0 +1,4 @@
+nas/cache/
+nas/truenas-wifi.env
+nas/wpa_supplicant.conf
+*.tar

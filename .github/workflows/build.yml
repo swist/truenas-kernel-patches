@@ -1,0 +1,92 @@
+name: build bundle
+
+on:
+  workflow_call:
+    inputs:
+      tag:    { type: string, required: true }
+      debian: { type: string, required: true }
+      rev:    { type: number, required: true }
+  workflow_dispatch:
+    inputs:
+      tag:    { description: "TrueNAS tag, e.g. TS-25.10.8", type: string, required: true }
+      debian: { description: "bookworm (25.10) / trixie (26+)", type: string, default: trixie }
+      rev:    { description: "bundle revision", type: number, default: 1 }
+      skip_scst: { description: "skip SCST (only if you never use iSCSI)", type: boolean, default: false }
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  build:
+    # A full TrueNAS kernel (all modules + debug info + BTF) takes ~3h on a
+    # 4-core hosted runner. Set the repo variable BUILD_RUNNER to e.g.
+    # '["self-hosted","linux","x64"]' to use a faster self-hosted machine.
+    runs-on: ${{ vars.BUILD_RUNNER && fromJSON(vars.BUILD_RUNNER) || 'ubuntu-latest' }}
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space (hosted runner)
+        if: ${{ !vars.BUILD_RUNNER }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          sudo docker image prune -af >/dev/null
+          df -h / /mnt
+
+      - name: Build in debian:${{ inputs.debian }}
+        run: |
+          work=/mnt/tnwifi; [ -w /mnt ] || work=$HOME/tnwifi
+          sudo mkdir -p "$work/out" && sudo chmod 777 "$work"
+          docker run --rm \
+            -e BUNDLE_REV=${{ inputs.rev }} \
+            -e SKIP_SCST=${{ inputs.skip_scst && '1' || '0' }} \
+            -e WORK=/work/build \
+            -v "$PWD:/src:ro" -v "$work:/work" \
+            debian:${{ inputs.debian }} \
+            /src/scripts/ci-container.sh "${{ inputs.tag }}" /work/out 2>&1 | tee build.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Locate output
+        run: |
+          work=/mnt/tnwifi; [ -d "$work/out" ] || work=$HOME/tnwifi
+          echo "OUT=$work/out" >> "$GITHUB_ENV"
+          ls -la "$work/out"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="truenas-wifi-${{ inputs.tag }}-r${{ inputs.rev }}"
+          tar -xOf "$OUT/$name.tar" ./manifest.json > manifest.json
+          {
+            echo "Wi-Fi (Intel BE200) kernel bundle for TrueNAS **${{ inputs.tag }}**, revision ${{ inputs.rev }}."
+            echo
+            echo "Kernel release: \`$(jq -r .kernel_release manifest.json)\`"
+            echo
+            echo '| package | version |'; echo '|---|---|'
+            jq -r '.debs[] | "| \(.package) | \(.version) |"' manifest.json
+            echo
+            echo "Install on the NAS with \`truenas-wifi sync\` (automatic) or \`truenas-wifi install $name.tar\`."
+          } > notes.md
+          gh release create "wifi-${{ inputs.tag }}-r${{ inputs.rev }}" \
+            "$OUT/$name.tar" "$OUT/$name.tar.sha256" manifest.json \
+            --title "$name" --notes-file notes.md
+
+      - name: Open an issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Build failed: ${{ inputs.tag }} r${{ inputs.rev }}"
+          if gh issue list --state open --search "\"$title\" in:title" --json number -q '.[0].number' | grep -q .; then exit 0; fi
+          {
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo "If a patch under \`patches/linux/\` no longer applies, rebase it onto the new tag and push; the watcher rebuilds automatically."
+            echo
+            echo '<details><summary>last 80 log lines</summary>'; echo; echo '```'
+            tail -80 build.log 2>/dev/null || true
+            echo '```'; echo '</details>'
+          } > body.md
+          gh issue create --title "$title" --body-file body.md

@@ -1,0 +1,13 @@
+# Copy to wpa_supplicant.conf next to truenas-wifi and chmod 600 it.
+ctrl_interface=DIR=/run/wpa_supplicant GROUP=root
+update_config=0
+country=US
+
+network={
+    ssid="YourNetwork"
+    # WPA3-Personal (SAE). BE200 supports it; keep "WPA-PSK" for WPA2 networks.
+    key_mgmt=SAE WPA-PSK
+    ieee80211w=1
+    sae_pwe=2
+    psk="your-passphrase"
+}

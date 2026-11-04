@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+# truenas-wifi - keep a Wi-Fi (Intel BE200) enabled kernel on TrueNAS.
+#
+# Lives on a pool (e.g. /mnt/tank/truenas-wifi/) so it survives TrueNAS updates.
+#
+#   truenas-wifi setup                 register boot (POSTINIT) + cron hooks in TrueNAS
+#   truenas-wifi sync                  make sure the boot environment used on next boot
+#                                      has the Wi-Fi kernel (downloads the bundle that
+#                                      matches its TrueNAS version from GitHub Releases)
+#   truenas-wifi install BUNDLE.tar [BE]
+#                                      install a local bundle into BE (default: clone of
+#                                      the running BE); never modifies the running BE
+#   truenas-wifi up                    load iwlwifi, start wpa_supplicant + DHCP
+#   truenas-wifi status
+#
+# Settings: truenas-wifi.env next to this script (see truenas-wifi.env.example).
+set -euo pipefail
+
+SELF=$(readlink -f "$0")
+SELF_DIR=$(dirname "$SELF")
+[ -f "$SELF_DIR/truenas-wifi.env" ] && . "$SELF_DIR/truenas-wifi.env"
+
+GITHUB_REPO=${GITHUB_REPO:-swist/truenas-kernel-patches}
+CACHE_DIR=${CACHE_DIR:-$SELF_DIR/cache}
+WPA_CONF=${WPA_CONF:-$SELF_DIR/wpa_supplicant.conf}
+WIFI_IFACE=${WIFI_IFACE:-auto}
+WIFI_COUNTRY=${WIFI_COUNTRY:-}
+WIFI_ADDRESS=${WIFI_ADDRESS:-}      # e.g. 192.168.1.20/24; empty = DHCP
+WIFI_GATEWAY=${WIFI_GATEWAY:-}
+AUTO_ACTIVATE=${AUTO_ACTIVATE:-1}   # activate the patched clone of the running BE
+AUTO_REBOOT=${AUTO_REBOOT:-0}       # reboot after patching the next-boot BE
+ALLOW_SECURE_BOOT=${ALLOW_SECURE_BOOT:-0}
+PROP=truenas-wifi:bundle            # ZFS user property marking a patched BE
+PROP_VER=truenas-wifi:version
+
+log()  { echo "truenas-wifi: $*" >&2; logger -t truenas-wifi -- "$*" 2>/dev/null || true; }
+die()  { log "ERROR: $*"; exit 1; }
+need_root() { [ "$(id -u)" = 0 ] || die "must run as root"; }
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+secure_boot_enabled() {
+    local v
+    v=$(ls /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | head -1) || true
+    [ -n "$v" ] && [ "$(od -An -t u1 -j4 -N1 "$v" 2>/dev/null | tr -d ' ')" = 1 ]
+}
+
+# id<TAB>dataset<TAB>active<TAB>activated  for every boot environment
+be_list() {
+    midclt call boot.environment.query | python3 -c '
+import json, sys
+for be in json.load(sys.stdin):
+    print("\t".join([be["id"], be["dataset"], str(be["active"]), str(be["activated"])]))'
+}
+
+be_field() {  # be_field <id> <col>
+    be_list | awk -F'\t' -v id="$1" -v c="$2" '$1 == id { print $c }'
+}
+
+zprop() { zfs get -H -o value "$1" "$2" 2>/dev/null | sed 's/^-$//'; }
+
+# TrueNAS version a BE runs: our recorded property, else parsed from its name.
+be_version() {
+    local ds; ds=$(be_field "$1" 2)
+    local v; v=$(zprop "$PROP_VER" "$ds")
+    [ -n "$v" ] || v=$(grep -oE '^[0-9]+\.[0-9]+(\.[0-9]+)*(-(BETA|RC)\.[0-9]+)?' <<<"$1" || true)
+    echo "$v"
+}
+
+# Latest bundle published for a TrueNAS version: prints "<url-of-tar> <rev>".
+latest_bundle() {
+    local version=$1
+    curl -fsSL "https://api.github.com/repos/$GITHUB_REPO/releases?per_page=100" | python3 -c '
+import json, re, sys
+version = sys.argv[1]
+pat = re.compile(r"^truenas-wifi-TS-" + re.escape(version) + r"-r(\d+)\.tar$")
+best = None
+for rel in json.load(sys.stdin):
+    if rel.get("draft"):
+        continue
+    for a in rel.get("assets", []):
+        m = pat.match(a["name"])
+        if m and (best is None or int(m.group(1)) > best[1]):
+            best = (a["browser_download_url"], int(m.group(1)))
+if best:
+    print(best[0], best[1])' "$version"
+}
+
+download_bundle() {  # download_bundle <url> -> path
+    local url=$1 f
+    mkdir -p "$CACHE_DIR"
+    f="$CACHE_DIR/$(basename "$url")"
+    if [ ! -s "$f" ]; then
+        curl -fL --retry 3 -o "$f.part" "$url"
+        curl -fsSL --retry 3 -o "$f.sha256" "$url.sha256"
+        mv "$f.part" "$f"
+    fi
+    (cd "$CACHE_DIR" && sha256sum -c --status "$(basename "$f").sha256") \
+        || { rm -f "$f" "$f.sha256"; die "checksum mismatch for $(basename "$f")"; }
+    echo "$f"
+}
+
+# ---------------------------------------------------------------------------
+# install a bundle into a (non-running) boot environment
+# ---------------------------------------------------------------------------
+
+MNT=""; STAGE=""; RO_RESTORE=(); MOUNTED=(); HOOKS_OFF=""; DPKG_MODE=""
+
+cleanup_mounts() {
+    set +e
+    if [ -n "$MNT" ]; then
+        [ -n "$HOOKS_OFF" ] && [ -d "$MNT/etc/kernel/postinst.d.tnwifi-off" ] && \
+            mv "$MNT/etc/kernel/postinst.d.tnwifi-off" "$MNT/etc/kernel/postinst.d"
+        rm -f "$MNT/usr/sbin/policy-rc.d"
+        [ -n "$DPKG_MODE" ] && chmod "$DPKG_MODE" "$MNT/usr/bin/dpkg"
+        for m in sys proc dev; do umount -R "$MNT/$m" 2>/dev/null; done
+        local ds
+        for ds in "${RO_RESTORE[@]}"; do zfs set readonly=on "$ds"; done
+        local i
+        for ((i=${#MOUNTED[@]}-1; i>=0; i--)); do umount "${MOUNTED[$i]}"; done
+        rmdir "$MNT" 2>/dev/null
+    fi
+    [ -n "$STAGE" ] && rm -rf "$STAGE"
+    MNT=""; STAGE=""; RO_RESTORE=(); MOUNTED=()
+}
+
+mount_be() {  # mount_be <root-dataset>   -> sets $MNT
+    local ds=$1
+    MNT=$(mktemp -d /tmp/truenas-wifi-be.XXXXXX)
+    mount -t zfs -o zfsutil "$ds" "$MNT"; MOUNTED+=("$MNT")
+    # Child datasets as listed by the TrueNAS installer, parents first.
+    local name mp
+    while IFS=$'\t' read -r name mp; do
+        mkdir -p "$MNT$mp" 2>/dev/null || true
+        mount -t zfs -o zfsutil "$ds/$name" "$MNT$mp"; MOUNTED+=("$MNT$mp")
+    done < <(python3 -c '
+import json, sys
+conf = json.load(open(sys.argv[1]))
+rows = [(e["fhs_entry"]["name"], e["fhs_entry"].get("mountpoint") or "/" + e["fhs_entry"]["name"]) for e in conf]
+for name, mp in sorted(rows, key=lambda r: r[1].count("/")):
+    print(f"{name}\t{mp}")' "$MNT/conf/truenas_root_ds.json")
+    # Make every mounted dataset writable for the duration.
+    local d
+    local -a all_ds=("$ds")
+    mapfile -t -O 1 all_ds < <(python3 -c '
+import json, sys
+for e in json.load(open(sys.argv[1])):
+    print(sys.argv[2] + "/" + e["fhs_entry"]["name"])' "$MNT/conf/truenas_root_ds.json" "$ds")
+    for d in "${all_ds[@]}"; do
+        if [ "$(zprop readonly "$d")" = on ]; then
+            zfs set readonly=off "$d"; RO_RESTORE+=("$d")
+        fi
+    done
+    for d in "${MOUNTED[@]}"; do mount -o remount,rw "$d"; done
+    mount --rbind /dev "$MNT/dev"; mount -t proc proc "$MNT/proc"; mount -t sysfs sysfs "$MNT/sys"
+}
+
+install_bundle() {  # install_bundle <bundle.tar> <be-id>
+    local tar=$1 be=$2 ds
+    ds=$(be_field "$be" 2); [ -n "$ds" ] || die "no boot environment '$be'"
+    [ "$(be_field "$be" 3)" = True ] && die "refusing to modify the running boot environment '$be'"
+
+    STAGE=$(mktemp -d /tmp/truenas-wifi-stage.XXXXXX)
+    trap cleanup_mounts EXIT
+    tar -C "$STAGE" -xf "$tar"
+    local kver tag rev
+    read -r kver tag rev < <(python3 -c '
+import json, sys; m = json.load(open(sys.argv[1]))
+print(m["kernel_release"], m["truenas_tag"], m["bundle_rev"])' "$STAGE/manifest.json")
+    python3 -c '
+import hashlib, json, os, sys
+d = sys.argv[1]
+for e in json.load(open(os.path.join(d, "manifest.json")))["debs"]:
+    h = hashlib.sha256(open(os.path.join(d, e["file"]), "rb").read()).hexdigest()
+    if h != e["sha256"]:
+        sys.exit("checksum mismatch: " + e["file"])' "$STAGE" || die "bundle is corrupt"
+
+    local snap
+    snap="truenas-wifi-pre-$(date +%Y%m%d%H%M%S)"
+    zfs snapshot -r "$ds@$snap"
+    log "snapshot $ds@$snap taken (rollback: zfs list -t snapshot -r $ds | grep $snap)"
+
+    mount_be "$ds"
+    [ -f "$MNT/boot/vmlinuz-$kver" ] || \
+        die "bundle is for kernel $kver but BE '$be' has $(cd "$MNT/boot" && echo vmlinuz-*) - wrong TrueNAS version"
+
+    # TrueNAS strips dpkg's exec bit; restore it for the duration (upgrade_pyutils does the same).
+    DPKG_MODE=$(stat -c %a "$MNT/usr/bin/dpkg"); chmod 755 "$MNT/usr/bin/dpkg"
+    printf '#!/bin/sh\nexit 101\n' > "$MNT/usr/sbin/policy-rc.d"; chmod 755 "$MNT/usr/sbin/policy-rc.d"
+    # Kernel postinst hooks would run update-grub etc. against the live system; we
+    # only need the initramfs, which we rebuild ourselves below.
+    if [ -d "$MNT/etc/kernel/postinst.d" ]; then
+        mv "$MNT/etc/kernel/postinst.d" "$MNT/etc/kernel/postinst.d.tnwifi-off"; HOOKS_OFF=1
+    fi
+
+    local -a debs=()
+    local file pkg
+    while IFS=$'\t' read -r file pkg; do
+        local installed=0
+        chroot "$MNT" /usr/bin/dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed' && installed=1
+        case $pkg in
+            linux-image-truenas-production-*|openzfs-zfs-modules-*|truenas-wifi-firmware-*|wireless-regdb|iw|wpasupplicant)
+                debs+=("$file") ;;                              # always
+            libnl-*|libpcsclite1)
+                [ $installed = 0 ] && debs+=("$file") ;;        # only if TrueNAS lacks it
+            *)
+                [ $installed = 1 ] && debs+=("$file") ;;        # headers, perf, scst: replace if present
+        esac
+    done < <(python3 -c '
+import json, sys
+for e in json.load(open(sys.argv[1]))["debs"]:
+    print(e["file"] + "\t" + e["package"])' "$STAGE/manifest.json")
+
+    mkdir -p "$MNT/var/tmp/truenas-wifi"
+    local -a inroot=()
+    for file in "${debs[@]}"; do cp "$STAGE/$file" "$MNT/var/tmp/truenas-wifi/"; inroot+=("/var/tmp/truenas-wifi/$file"); done
+    log "installing into $be: ${debs[*]}"
+    chroot "$MNT" /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/dpkg -i --force-confold "${inroot[@]}"
+    rm -rf "$MNT/var/tmp/truenas-wifi"
+    chroot "$MNT" depmod -a "$kver"
+    chroot "$MNT" update-initramfs -u -k "$kver"
+
+    cleanup_mounts
+    trap - EXIT
+    zfs set "$PROP=$tag-r$rev" "$ds"
+    log "BE '$be' now has the Wi-Fi kernel ($tag-r$rev, $kver)"
+}
+
+clone_running_be() {  # prints new BE id
+    local cur; cur=$(be_list | awk -F'\t' '$3 == "True" { print $1 }')
+    local ver; ver=$(be_version "$cur")
+    local base="${ver:-$cur}-wifi" name n=1
+    name=$base
+    while [ -n "$(be_field "$name" 1)" ]; do n=$((n+1)); name="$base-$n"; done
+    midclt call boot.environment.clone "{\"id\": \"$cur\", \"target\": \"$name\"}" >/dev/null
+    zfs set "$PROP_VER=$ver" "$(be_field "$name" 2)"
+    zfs inherit "$PROP" "$(be_field "$name" 2)" 2>/dev/null || true
+    echo "$name"
+}
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+check_secure_boot() {
+    if secure_boot_enabled && [ "$ALLOW_SECURE_BOOT" != 1 ]; then
+        die "Secure Boot is enabled: a self-built kernel will not boot. Disable it in firmware (or set ALLOW_SECURE_BOOT=1 after enrolling your own key)."
+    fi
+}
+
+cmd_install() {
+    need_root; check_secure_boot
+    local tar=$1 be=${2:-}
+    [ -f "$tar" ] || die "no such bundle: $tar"
+    [ -n "$be" ] || be=$(clone_running_be)
+    install_bundle "$tar" "$be"
+    if [ "$AUTO_ACTIVATE" = 1 ]; then
+        midclt call boot.environment.activate "{\"id\": \"$be\"}" >/dev/null
+        log "activated '$be' - reboot to use it"
+    fi
+}
+
+cmd_sync() {
+    need_root; check_secure_boot
+    local next running
+    next=$(be_list | awk -F'\t' '$4 == "True" { print $1 }')
+    running=$(be_list | awk -F'\t' '$3 == "True" { print $1 }')
+    [ -n "$next" ] || die "cannot determine next-boot BE"
+    local ver; ver=$(be_version "$next")
+    [ -n "$ver" ] || die "cannot tell TrueNAS version of BE '$next'"
+
+    local url rev
+    read -r url rev < <(latest_bundle "$ver") || true
+    if [ -z "${url:-}" ]; then
+        log "no Wi-Fi bundle published yet for TrueNAS $ver (BE '$next'); will retry. Do not reboot into it if Wi-Fi is your only link."
+        exit 3
+    fi
+    local have; have=$(zprop "$PROP" "$(be_field "$next" 2)")
+    if [ "$have" = "TS-$ver-r$rev" ]; then
+        log "BE '$next' is up to date ($have)"; return 0
+    fi
+
+    local tar; tar=$(download_bundle "$url")
+    local target=$next
+    if [ "$next" = "$running" ]; then
+        target=$(clone_running_be)
+    fi
+    install_bundle "$tar" "$target"
+    if [ "$target" != "$next" ] || [ "$AUTO_ACTIVATE" = 1 ]; then
+        midclt call boot.environment.activate "{\"id\": \"$target\"}" >/dev/null
+    fi
+    log "next boot: '$target' (Wi-Fi kernel TS-$ver-r$rev)"
+    if [ "$AUTO_REBOOT" = 1 ]; then
+        log "rebooting"; midclt call system.reboot "\"truenas-wifi: Wi-Fi kernel installed\"" >/dev/null
+    fi
+}
+
+wifi_iface() {
+    if [ "$WIFI_IFACE" != auto ]; then echo "$WIFI_IFACE"; return; fi
+    local d
+    for d in /sys/class/net/*; do
+        [ -e "$d/phy80211" ] && { basename "$d"; return; }
+    done
+}
+
+cmd_up() {
+    need_root
+    [ -f "$WPA_CONF" ] || die "missing $WPA_CONF (copy wpa_supplicant.conf.example)"
+    modprobe iwlwifi
+    local ifc="" i
+    for i in $(seq 1 20); do ifc=$(wifi_iface); [ -n "$ifc" ] && break; sleep 1; done
+    [ -n "$ifc" ] || die "no wireless interface appeared (dmesg | grep iwlwifi)"
+    [ -n "$WIFI_COUNTRY" ] && iw reg set "$WIFI_COUNTRY" || true
+    ip link set "$ifc" up
+    if [ -f "/run/wpa_supplicant-$ifc.pid" ]; then kill "$(cat "/run/wpa_supplicant-$ifc.pid")" 2>/dev/null || true; sleep 1; fi
+    wpa_supplicant -B -D nl80211 -i "$ifc" -c "$WPA_CONF" -P "/run/wpa_supplicant-$ifc.pid"
+    if [ -n "$WIFI_ADDRESS" ]; then
+        ip addr replace "$WIFI_ADDRESS" dev "$ifc"
+        [ -n "$WIFI_GATEWAY" ] && ip route replace default via "$WIFI_GATEWAY" dev "$ifc"
+    elif command -v dhcpcd >/dev/null; then
+        dhcpcd -b "$ifc"
+    elif command -v dhclient >/dev/null; then
+        dhclient -nw "$ifc"
+    else
+        log "no DHCP client found; set WIFI_ADDRESS/WIFI_GATEWAY"
+    fi
+    log "Wi-Fi up on $ifc"
+}
+
+cmd_setup() {
+    need_root
+    local up="$SELF up" sync="$SELF sync"
+    if [ "$(midclt call initshutdownscript.query "[[\"command\", \"=\", \"$up\"]]")" = "[]" ]; then
+        midclt call initshutdownscript.create "{\"type\": \"COMMAND\", \"command\": \"$up\", \"when\": \"POSTINIT\", \"enabled\": true, \"timeout\": 60, \"comment\": \"truenas-wifi: bring up Wi-Fi\"}" >/dev/null
+        log "registered POSTINIT: $up"
+    fi
+    if [ "$(midclt call cronjob.query "[[\"command\", \"=\", \"$sync\"]]")" = "[]" ]; then
+        midclt call cronjob.create "{\"command\": \"$sync\", \"user\": \"root\", \"enabled\": true, \"description\": \"truenas-wifi: keep Wi-Fi kernel on next-boot BE\", \"stdout\": false, \"stderr\": false, \"schedule\": {\"minute\": \"*/15\", \"hour\": \"*\", \"dom\": \"*\", \"month\": \"*\", \"dow\": \"*\"}}" >/dev/null
+        log "registered cron (every 15 min): $sync"
+    fi
+}
+
+cmd_status() {
+    printf '%-28s %-8s %-9s %s\n' BE running next-boot wifi-bundle
+    local id ds act nxt
+    while IFS=$'\t' read -r id ds act nxt; do
+        printf '%-28s %-8s %-9s %s\n' "$id" "$act" "$nxt" "$(zprop "$PROP" "$ds")"
+    done < <(be_list)
+    echo "kernel: $(uname -r)  secure-boot: $(secure_boot_enabled && echo on || echo off)"
+    echo "iwlwifi loaded: $([ -d /sys/module/iwlwifi ] && echo yes || echo no)  iface: $(wifi_iface || true)"
+}
+
+case ${1:-} in
+    setup)   cmd_setup ;;
+    sync)    cmd_sync ;;
+    install) shift; [ $# -ge 1 ] || die "usage: install BUNDLE.tar [BE]"; cmd_install "$@" ;;
+    up)      cmd_up ;;
+    status)  cmd_status ;;
+    *) sed -n '2,17p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
