@@ -12,6 +12,6 @@ apt-get install -y -qq --no-install-recommends \
     binutils-dev libiberty-dev liblzma-dev libzstd-dev libcap-dev libnuma-dev \
     libbabeltrace-dev libcapstone-dev llvm-dev default-jdk-headless \
     autoconf automake libtool gawk uuid-dev libblkid-dev libudev-dev libaio-dev \
-    libattr1-dev libtirpc-dev zlib1g-dev quilt dh-python lsb-release >/dev/null
+    libattr1-dev libtirpc-dev zlib1g-dev quilt dh-python lsb-release lintian >/dev/null
 git config --global --add safe.directory '*'
 exec "$(dirname "$0")/build.sh" all "$@"

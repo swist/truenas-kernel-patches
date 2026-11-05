@@ -151,6 +151,13 @@ build_scst() {
         cd "$d"
         export KVER="$kver" KDIR="/lib/modules/$kver/build"
         sed -i 's/^DEBIAN_REVISION=.*/DEBIAN_REVISION=~truenas+1/g' Makefile
+        # SCST's Build-Depends name all four TrueNAS kernel packages (production
+        # + debug, image + headers) purely for scale-build's ordering; only the
+        # production headers at $KDIR are actually used. Drop them so debuild's
+        # build-dependency check doesn't fail.
+        sed -i -E '/^ linux-(headers|image)-truenas-[a-z]+-amd64,?$/d' debian/control
+        awk '/^Build-Depends/,/^[A-Z][a-z-]+:/' debian/control | grep -q 'linux-.*-truenas' \
+            && die "SCST Build-Depends still names TrueNAS kernel packages"
         make debian/changelog
         make 2perf
         make scst-dist-gzip
@@ -230,15 +237,23 @@ cmd_all() {
     local tag=$1 dest=$2
     [ "$(id -u)" = 0 ] || die "run as root (inside the build container)"
     mkdir -p "$WORK" "$dest"
-    local out="$WORK/bundle"; rm -rf "$out"; mkdir -p "$out"
+    local out="$WORK/bundle"
 
-    log "kernel $tag"
-    rm -rf "$WORK/linux"; mkdir -p "$WORK/linux"
-    git clone -q --depth 1 -b "$tag" "$TN_GH/linux" "$WORK/linux/src"
-    apply_patches "$WORK/linux/src"
-    configure_kernel "$WORK/linux/src"
-    build_kernel "$WORK/linux/src" "$out"
-    rm -rf "$WORK/linux/src"   # reclaim disk before the module builds
+    # REUSE_KERNEL=1 keeps kernel .debs from a previous run in $WORK/bundle and
+    # redoes only the later stages (handy when iterating on ZFS/SCST/firmware).
+    if [ "${REUSE_KERNEL:-0}" = 1 ] && ls "$out"/linux-image-truenas-production-*.deb >/dev/null 2>&1; then
+        log "reusing kernel packages from a previous run"
+        find "$out" -maxdepth 1 -type f ! -name 'linux-*' -delete
+    else
+        rm -rf "$out"; mkdir -p "$out"
+        log "kernel $tag"
+        rm -rf "$WORK/linux"; mkdir -p "$WORK/linux"
+        git clone -q --depth 1 -b "$tag" "$TN_GH/linux" "$WORK/linux/src"
+        apply_patches "$WORK/linux/src"
+        configure_kernel "$WORK/linux/src"
+        build_kernel "$WORK/linux/src" "$out"
+        rm -rf "$WORK/linux"   # reclaim disk before the module builds
+    fi
 
     local img kver
     img=$(ls "$out"/linux-image-truenas-production-*.deb | head -1)
