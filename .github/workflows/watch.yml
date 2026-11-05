@@ -8,7 +8,7 @@ on:
     - cron: "17 */6 * * *"
   push:
     branches: [main, master]
-    paths: ["config/**", "patches/**", "scripts/**"]
+    paths: ["config/**", "patches/**", "scripts/**", ".github/workflows/**"]
   workflow_dispatch:
     inputs:
       mode:
@@ -21,9 +21,11 @@ permissions:
   contents: write
   issues: write
 
+# A push means the patch set/scripts changed, so any build still running is
+# already stale: cancel it. Scheduled/manual runs queue instead.
 concurrency:
   group: watch
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   detect:
