@@ -115,7 +115,10 @@ build_kernel() {
 }
 
 kernel_release_of() {  # kernel release string from the image .deb
-    dpkg-deb -c "$1" | grep -oE 'lib/modules/[^/]+/' | head -1 | cut -d/ -f3
+    # Read the whole listing (no `| head`): with pipefail, closing the pipe
+    # early kills dpkg-deb with SIGPIPE and fails the build.
+    dpkg-deb -c "$1" | awk 'k == "" && match($0, /lib\/modules\/[^\/]+\//) {
+        k = substr($0, RSTART + 12, RLENGTH - 13) } END { print k }'
 }
 
 # --------------------------------------------------------------------------
@@ -189,7 +192,7 @@ build_firmware_deb() {
                               -o -name 'iwlwifi-gl-c0-fm-c0*' -o -name 'iwlwifi-bz-b0-fm-c0*' \
                               -o -name 'iwlwifi-sc-a0-fm-c0*' \) -print0 \
         | xargs -0 -r cp -a --parents -t "$pkg/usr/lib/firmware")
-    [ -n "$(find "$pkg/usr/lib/firmware" -name '*.ucode' | head -1)" ] || die "no AX211/BE200/BE201 firmware found in linux-firmware"
+    [ -n "$(find "$pkg/usr/lib/firmware" -name '*.ucode' -print -quit)" ] || die "no AX211/BE200/BE201 firmware found in linux-firmware"
     cat > "$pkg/DEBIAN/control" <<EOF
 Package: truenas-wifi-firmware-iwlwifi
 Version: ${fwver}
@@ -256,7 +259,9 @@ cmd_all() {
     fi
 
     local img kver
-    img=$(ls "$out"/linux-image-truenas-production-*.deb | head -1)
+    local -a imgs=("$out"/linux-image-truenas-production-amd64_*.deb)
+    [ -f "${imgs[0]}" ] || die "kernel image package not found in $out"
+    img=${imgs[0]}
     kver=$(kernel_release_of "$img")
     log "kernel release $kver"
     dpkg -i "$out"/linux-headers-truenas-production-*.deb >&2

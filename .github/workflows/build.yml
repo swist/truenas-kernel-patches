@@ -34,24 +34,53 @@ jobs:
           sudo docker image prune -af >/dev/null
           df -h / /mnt
 
+      - name: Prepare work dir
+        run: |
+          work=/mnt/tnwifi
+          if ! sudo mkdir -p "$work" 2>/dev/null; then work=$HOME/tnwifi; mkdir -p "$work"; fi
+          sudo mkdir -p "$work/out" "$work/build/bundle" && sudo chmod -R 777 "$work"
+          echo "WORKDIR=$work" >> "$GITHUB_ENV"
+          echo "OUT=$work/out" >> "$GITHUB_ENV"
+
+      # The kernel is ~2h of the build. Cache its packages so a failure in a
+      # later stage (ZFS/SCST/firmware/publish) retries in minutes. The key
+      # covers everything that changes the kernel; bump "kernel-v1" if the
+      # kernel part of scripts/build.sh changes.
+      - name: Restore kernel packages
+        id: kcache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.WORKDIR }}/build/bundle/linux-*.deb
+          key: kernel-v1-${{ inputs.tag }}-r${{ inputs.rev }}-${{ hashFiles('config/wifi.config', 'patches/**') }}
+
       - name: Build in debian:${{ inputs.debian }}
         run: |
-          work=/mnt/tnwifi; [ -w /mnt ] || work=$HOME/tnwifi
-          sudo mkdir -p "$work/out" && sudo chmod 777 "$work"
           docker run --rm \
             -e BUNDLE_REV=${{ inputs.rev }} \
             -e SKIP_SCST=${{ inputs.skip_scst && '1' || '0' }} \
+            -e REUSE_KERNEL=${{ steps.kcache.outputs.cache-hit == 'true' && '1' || '0' }} \
             -e WORK=/work/build \
-            -v "$PWD:/src:ro" -v "$work:/work" \
+            -v "$PWD:/src:ro" -v "$WORKDIR:/work" \
             debian:${{ inputs.debian }} \
             /src/scripts/ci-container.sh "${{ inputs.tag }}" /work/out 2>&1 | tee build.log
           exit "${PIPESTATUS[0]}"
 
-      - name: Locate output
+      - name: Check for kernel packages
+        id: kpk
+        if: always()
         run: |
-          work=/mnt/tnwifi; [ -d "$work/out" ] || work=$HOME/tnwifi
-          echo "OUT=$work/out" >> "$GITHUB_ENV"
-          ls -la "$work/out"
+          if ls "$WORKDIR"/build/bundle/linux-image-truenas-production-amd64_*.deb >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"; else echo "exists=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Save kernel packages
+        if: always() && steps.kcache.outputs.cache-hit != 'true' && steps.kpk.outputs.exists == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.WORKDIR }}/build/bundle/linux-*.deb
+          key: kernel-v1-${{ inputs.tag }}-r${{ inputs.rev }}-${{ hashFiles('config/wifi.config', 'patches/**') }}
+
+      - name: List output
+        run: ls -la "$OUT"
 
       - name: Publish release
         env:
