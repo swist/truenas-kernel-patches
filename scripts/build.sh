@@ -87,29 +87,26 @@ verify_config() {
 
 build_kernel() {
     local src=$1 out=$2
-    local tn="$src/scripts/package/truenas"
-    # Same package names / kernel release as stock; Debian revision gets a
-    # "+wifiN" suffix so dpkg treats ours as an upgrade of TrueNAS's package.
-    local first orig ver name
-    first=$(head -1 "$tn/changelog")
-    name=${first%% *}
-    orig=$(sed -E 's/^[^ ]+ \(([^)]+)\).*/\1/' <<<"$first")
-    ver="${orig}+wifi${BUNDLE_REV}"
-    {
-        printf '%s (%s) sid; urgency=low\n\n' "$name" "$ver"
-        printf '  * Re-enable Wi-Fi (cfg80211/mac80211/iwlwifi) for Intel AX211/BE200/BE201.\n\n'
-        printf ' -- truenas-kernel-patches <noreply@localhost>  %s\n\n' "$(date -R)"
-        cat "$tn/changelog"
-    } > "$tn/changelog.new"
-    mv "$tn/changelog.new" "$tn/changelog"
-
     (
         cd "$src"
-        export EXTRAVERSION=-production PYTHON=python3 KDEB_PKGVERSION="$ver"
+        # TrueNAS's mkdebian only sets srctree itself when KDEB_PKGVERSION is
+        # unset, and we leave that unset (see the version stamp below).
+        export EXTRAVERSION=-production PYTHON=python3 srctree=.
         rm -rf .git .gitattributes .gitignore   # as scale-build does: keeps KERNELRELEASE clean
         make syncconfig
         make archprepare
+        # Same package names / kernel release as stock, but the Debian version
+        # gets "+wifiN" so ours is distinguishable and sorts above TrueNAS's.
+        # TrueNAS's mkdebian sets the version with `dch --newversion <release>-1`
+        # ($version on 25.10, ${KERNELRELEASE} on 26+) and bindeb-pkg re-runs
+        # mkdebian (which wipes debian/), so the only place a suffix survives
+        # is that dch line itself.
+        local vre='--newversion (\$version|\$\{KERNELRELEASE\})-1 '
+        grep -qE -- "$vre" scripts/package/mkdebian \
+            || die "TrueNAS mkdebian changed: cannot find 'dch --newversion <release>-1' to version-stamp"
+        sed -i -E "s/$vre/--newversion \\1-1+wifi${BUNDLE_REV} /" scripts/package/mkdebian
         ./scripts/package/mkdebian
+        echo "kernel package version: $(head -1 debian/changelog)"
         rm -f .config.old
         make -j"$JOBS" bindeb-pkg
     ) >&2
