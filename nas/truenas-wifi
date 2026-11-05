@@ -185,6 +185,12 @@ for e in json.load(open(os.path.join(d, "manifest.json")))["debs"]:
     mount_be "$ds"
     [ -f "$MNT/boot/vmlinuz-$kver" ] || \
         die "bundle is for kernel $kver but BE '$be' has $(cd "$MNT/boot" && echo vmlinuz-*) - wrong TrueNAS version"
+    # Each BE carries its own copy of the debug-kernel flag (copied from /data
+    # when the update was installed). If set, GRUB boots the stock debug kernel
+    # and our production kernel is never used.
+    if [ "$(cat "$MNT/data/subsystems/initramfs/debug_kernel" 2>/dev/null)" = 1 ]; then
+        die "BE '$be' is set to boot TrueNAS's debug kernel (it was installed while the debug kernel was enabled), so the Wi-Fi kernel would never run. Boot it, disable the debug kernel, then run sync again."
+    fi
 
     # TrueNAS strips dpkg's exec bit; restore it for the duration (upgrade_pyutils does the same).
     DPKG_MODE=$(stat -c %a "$MNT/usr/bin/dpkg"); chmod 755 "$MNT/usr/bin/dpkg"
@@ -250,8 +256,20 @@ check_secure_boot() {
     fi
 }
 
+debug_kernel_enabled() {
+    midclt call system.advanced.config | python3 -c '
+import json, sys
+sys.exit(0 if json.load(sys.stdin).get("debugkernel") else 1)'
+}
+
+check_debug_kernel() {
+    if debug_kernel_enabled; then
+        die "TrueNAS is set to boot its debug kernel, which has no Wi-Fi. Disable it first: System > Advanced Settings > Kernel, or: midclt call system.advanced.update '{\"debugkernel\": false}'"
+    fi
+}
+
 cmd_install() {
-    need_root; check_secure_boot
+    need_root; check_secure_boot; check_debug_kernel
     local tar=$1 be=${2:-}
     [ -f "$tar" ] || die "no such bundle: $tar"
     [ -n "$be" ] || be=$(clone_running_be)
@@ -263,7 +281,7 @@ cmd_install() {
 }
 
 cmd_sync() {
-    need_root; check_secure_boot
+    need_root; check_secure_boot; check_debug_kernel
     local next running
     next=$(be_list | awk -F'\t' '$4 == "True" { print $1 }')
     running=$(be_list | awk -F'\t' '$3 == "True" { print $1 }')
@@ -348,7 +366,7 @@ cmd_status() {
     while IFS=$'\t' read -r id ds act nxt; do
         printf '%-28s %-8s %-9s %s\n' "$id" "$act" "$nxt" "$(zprop "$PROP" "$ds")"
     done < <(be_list)
-    echo "kernel: $(uname -r)  secure-boot: $(secure_boot_enabled && echo on || echo off)"
+    echo "kernel: $(uname -r)  secure-boot: $(secure_boot_enabled && echo on || echo off)  debug-kernel: $(debug_kernel_enabled && echo ON || echo off)"
     echo "iwlwifi loaded: $([ -d /sys/module/iwlwifi ] && echo yes || echo no)  iface: $(wifi_iface || true)"
 }
 
