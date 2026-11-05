@@ -1,8 +1,11 @@
 name: watch upstream
 
 # Polls truenas/linux, truenas/zfs and truenas/scst for new TrueNAS release
-# tags and builds a Wi-Fi bundle for each one. A push that changes the patch
-# set or config rebuilds the newest release of every tracked line as rN+1.
+# tags and builds a Wi-Fi bundle for each one.
+# Pushes: a change to config/ or patches/ (what goes into the kernel) rebuilds
+# the newest release of every tracked line as rN+1. Any other push (build
+# scripts, workflows, docs) only retries releases that have no bundle yet, so
+# fixing the build never republishes an identical bundle.
 on:
   schedule:
     - cron: "17 */6 * * *"
@@ -35,12 +38,24 @@ jobs:
       any: ${{ steps.find.outputs.any }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - id: find
         env:
           GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
         run: |
           mode=new
-          if [ "${{ github.event_name }}" = push ] || [ "${{ inputs.mode }}" = latest ]; then mode=--latest; fi
+          if [ "${{ inputs.mode }}" = latest ]; then mode=--latest; fi
+          if [ "${{ github.event_name }}" = push ]; then
+            if [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ] \
+               || ! git cat-file -e "$BEFORE" 2>/dev/null; then
+              mode=--latest   # new branch / unknown base: be safe
+            elif git diff --name-only "$BEFORE" "$GITHUB_SHA" | grep -qE '^(config|patches)/'; then
+              mode=--latest
+            fi
+          fi
+          echo "mode: $mode"
           m=$(scripts/find-new-releases.sh $mode)
           echo "$m"
           echo "matrix=$m" >> "$GITHUB_OUTPUT"
