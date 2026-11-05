@@ -151,8 +151,11 @@ install also takes a `truenas-wifi-pre-*` snapshot of the target BE first.
 - Wi-Fi is configured outside the middleware. It won't appear under
   *Network → Interfaces*, so don't use it as the only interface for
   apps/VM bridges.
-- The **debug kernel** toggle (*Advanced → Kernel*) boots TrueNAS's stock
-  debug kernel, which has no Wi-Fi.
+- Both TrueNAS kernels are rebuilt: production and the **debug kernel**
+  (*System → Advanced Settings → Kernel*), each with matching debug ZFS/SCST
+  modules, so the toggle keeps working. Bundles from before this change
+  (`wifi-TS-25.10.8-r1`) only have the production kernel; the installer
+  refuses them while the debug kernel is enabled.
 - NVIDIA drivers (system extension) are built by iXsystems against the stock
   kernel. They are untouched; the changed structs aren't used by them, but
   this hasn't been verified.

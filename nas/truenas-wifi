@@ -165,10 +165,19 @@ install_bundle() {  # install_bundle <bundle.tar> <be-id>
     STAGE=$(mktemp -d /tmp/truenas-wifi-stage.XXXXXX)
     trap cleanup_mounts EXIT
     tar -C "$STAGE" -xf "$tar"
-    local kver tag rev
-    read -r kver tag rev < <(python3 -c '
+    local tag rev
+    read -r tag rev < <(python3 -c '
 import json, sys; m = json.load(open(sys.argv[1]))
-print(m["kernel_release"], m["truenas_tag"], m["bundle_rev"])' "$STAGE/manifest.json")
+print(m["truenas_tag"], m["bundle_rev"])' "$STAGE/manifest.json")
+    # Kernel flavours in the bundle: "production <release>" [+ "debug <release>"].
+    # Format-1 bundles (before debug support) carry only kernel_release.
+    local -A kernels=()
+    local fl kv
+    while read -r fl kv; do kernels[$fl]=$kv; done < <(python3 -c '
+import json, sys; m = json.load(open(sys.argv[1]))
+for f, k in (m.get("kernel_releases") or {"production": m["kernel_release"]}).items():
+    print(f, k)' "$STAGE/manifest.json")
+    [ -n "${kernels[production]:-}" ] || die "bundle manifest names no production kernel"
     python3 -c '
 import hashlib, json, os, sys
 d = sys.argv[1]
@@ -183,13 +192,17 @@ for e in json.load(open(os.path.join(d, "manifest.json")))["debs"]:
     log "snapshot $ds@$snap taken (rollback: zfs list -t snapshot -r $ds | grep $snap)"
 
     mount_be "$ds"
-    [ -f "$MNT/boot/vmlinuz-$kver" ] || \
-        die "bundle is for kernel $kver but BE '$be' has $(cd "$MNT/boot" && echo vmlinuz-*) - wrong TrueNAS version"
+    for kv in "${kernels[@]}"; do
+        [ -f "$MNT/boot/vmlinuz-$kv" ] || \
+            die "bundle has kernel $kv but BE '$be' has $(cd "$MNT/boot" && echo vmlinuz-*) - wrong TrueNAS version"
+    done
     # Each BE carries its own copy of the debug-kernel flag (copied from /data
-    # when the update was installed). If set, GRUB boots the stock debug kernel
-    # and our production kernel is never used.
-    if [ "$(cat "$MNT/data/subsystems/initramfs/debug_kernel" 2>/dev/null)" = 1 ]; then
-        die "BE '$be' is set to boot TrueNAS's debug kernel (it was installed while the debug kernel was enabled), so the Wi-Fi kernel would never run. Boot it, disable the debug kernel, then run sync again."
+    # when the update was installed). If it, or the live setting, selects the
+    # debug kernel, the bundle must contain a Wi-Fi debug kernel too, or GRUB
+    # would boot TrueNAS's stock debug kernel and Wi-Fi would never come up.
+    if [ -z "${kernels[debug]:-}" ] && \
+       { [ "$(cat "$MNT/data/subsystems/initramfs/debug_kernel" 2>/dev/null)" = 1 ] || debug_kernel_enabled; }; then
+        die "TrueNAS is set to boot its debug kernel, but this bundle ($tag-r$rev) only has a Wi-Fi production kernel. Use a newer bundle revision, or disable the debug kernel (System > Advanced Settings > Kernel)."
     fi
 
     # TrueNAS strips dpkg's exec bit; restore it for the duration (upgrade_pyutils does the same).
@@ -207,7 +220,7 @@ for e in json.load(open(os.path.join(d, "manifest.json")))["debs"]:
         local installed=0
         chroot "$MNT" /usr/bin/dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed' && installed=1
         case $pkg in
-            linux-image-truenas-production-*|openzfs-zfs-modules-*|truenas-wifi-firmware-*|wireless-regdb|iw|wpasupplicant)
+            linux-image-truenas-production-*|linux-image-truenas-debug-*|openzfs-zfs-modules-*|truenas-wifi-firmware-*|wireless-regdb|iw|wpasupplicant)
                 debs+=("$file") ;;                              # always
             libnl-*|libpcsclite1)
                 [ $installed = 0 ] && debs+=("$file") ;;        # only if TrueNAS lacks it
@@ -225,13 +238,15 @@ for e in json.load(open(sys.argv[1]))["debs"]:
     log "installing into $be: ${debs[*]}"
     chroot "$MNT" /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/dpkg -i --force-confold "${inroot[@]}"
     rm -rf "$MNT/var/tmp/truenas-wifi"
-    chroot "$MNT" depmod -a "$kver"
-    chroot "$MNT" update-initramfs -u -k "$kver"
+    for kv in "${kernels[@]}"; do
+        chroot "$MNT" depmod -a "$kv"
+        chroot "$MNT" update-initramfs -u -k "$kv"
+    done
 
     cleanup_mounts
     trap - EXIT
     zfs set "$PROP=$tag-r$rev" "$ds"
-    log "BE '$be' now has the Wi-Fi kernel ($tag-r$rev, $kver)"
+    log "BE '$be' now has the Wi-Fi kernel ($tag-r$rev: ${!kernels[*]})"
 }
 
 clone_running_be() {  # prints new BE id
@@ -262,14 +277,8 @@ import json, sys
 sys.exit(0 if json.load(sys.stdin).get("debugkernel") else 1)'
 }
 
-check_debug_kernel() {
-    if debug_kernel_enabled; then
-        die "TrueNAS is set to boot its debug kernel, which has no Wi-Fi. Disable it first: System > Advanced Settings > Kernel, or: midclt call system.advanced.update '{\"debugkernel\": false}'"
-    fi
-}
-
 cmd_install() {
-    need_root; check_secure_boot; check_debug_kernel
+    need_root; check_secure_boot
     local tar=$1 be=${2:-}
     [ -f "$tar" ] || die "no such bundle: $tar"
     [ -n "$be" ] || be=$(clone_running_be)
@@ -281,7 +290,7 @@ cmd_install() {
 }
 
 cmd_sync() {
-    need_root; check_secure_boot; check_debug_kernel
+    need_root; check_secure_boot
     local next running
     next=$(be_list | awk -F'\t' '$4 == "True" { print $1 }')
     running=$(be_list | awk -F'\t' '$3 == "True" { print $1 }')

@@ -7,10 +7,20 @@
 #     reject the stock modules, 26.x has it off and would load them unchecked)
 #   * iwlwifi firmware for AX211 / BE200 / BE201 only, wireless-regdb, iw, wpa_supplicant
 #
+# Both TrueNAS kernel flavours are built: "production" (the default) and
+# "debug" (System > Advanced Settings > Kernel > Enable Debug Kernel), each
+# with its own ZFS/SCST modules, mirroring scale-build's kernel/kernel-dbg,
+# openzfs/openzfs-dbg and scst/scst-dbg recipes.
+#
 # Usage (as root, inside a Debian container matching the release, see
 # config/releases.conf):
-#   scripts/build.sh all        TS-25.10.8 /out
-#   scripts/build.sh configure  /path/to/truenas-linux-tree   # config only
+#   scripts/build.sh all     TS-25.10.8 /out        # everything, sequentially
+#   FLAVOR=debug \
+#   scripts/build.sh kernel  TS-25.10.8 /debs       # one flavour: kernel+ZFS+SCST
+#   scripts/build.sh extras  /debs                  # firmware + userspace
+#   scripts/build.sh bundle  TS-25.10.8 /debs /out  # manifest + tar
+#   FLAVOR=debug \
+#   scripts/build.sh configure /path/to/truenas-linux-tree   # config check only
 #
 # Output: /out/truenas-wifi-<TS tag>-r<N>.tar  (+ .sha256)
 set -euo pipefail
@@ -19,6 +29,8 @@ REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 WORK=${WORK:-/var/tmp/tnwifi-build}
 JOBS=${JOBS:-$(nproc)}
 BUNDLE_REV=${BUNDLE_REV:-1}
+FLAVOR=${FLAVOR:-production}
+case $FLAVOR in production|debug) ;; *) echo "FLAVOR must be production or debug" >&2; exit 2 ;; esac
 LINUX_FIRMWARE_REPO=${LINUX_FIRMWARE_REPO:-https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git}
 TN_GH=${TN_GH:-https://github.com/truenas}
 
@@ -58,7 +70,7 @@ configure_kernel() {
         make -s defconfig
         ./scripts/kconfig/merge_config.sh -m .config "$tn/debian_amd64.config"
         ./scripts/kconfig/merge_config.sh -m .config "$tn/truenas.config"
-        ./scripts/kconfig/merge_config.sh -m .config "$tn/tn-production.config"
+        ./scripts/kconfig/merge_config.sh -m .config "$tn/tn-$FLAVOR.config"
         ./scripts/kconfig/merge_config.sh -m .config "$REPO_DIR/config/wifi.config"
         make -s olddefconfig
     ) >&2
@@ -91,7 +103,7 @@ build_kernel() {
         cd "$src"
         # TrueNAS's mkdebian only sets srctree itself when KDEB_PKGVERSION is
         # unset, and we leave that unset (see the version stamp below).
-        export EXTRAVERSION=-production PYTHON=python3 srctree=.
+        export EXTRAVERSION=-$FLAVOR PYTHON=python3 srctree=.
         rm -rf .git .gitattributes .gitignore   # as scale-build does: keeps KERNELRELEASE clean
         make syncconfig
         make archprepare
@@ -110,8 +122,11 @@ build_kernel() {
         rm -f .config.old
         make -j"$JOBS" bindeb-pkg
     ) >&2
-    # bindeb-pkg drops the .debs next to the source tree; skip the multi-GB -dbg package.
+    # bindeb-pkg drops the .debs next to the source tree; skip the multi-GB
+    # symbol package (*-dbg_*). Both flavours produce an identical
+    # linux-perf-truenas; keep only the production one.
     find "$(dirname "$src")" -maxdepth 1 -name '*.deb' ! -name '*-dbg_*' -exec mv -t "$out" {} +
+    [ "$FLAVOR" = production ] || rm -f "$out"/linux-perf-truenas_*.deb
 }
 
 kernel_release_of() {  # kernel release string from the image .deb
@@ -126,7 +141,7 @@ kernel_release_of() {  # kernel release string from the image .deb
 # --------------------------------------------------------------------------
 
 build_zfs() {
-    local tag=$1 kver=$2 out=$3 d="$WORK/zfs"
+    local tag=$1 kver=$2 out=$3 d="$WORK/$FLAVOR/zfs"
     rm -rf "$d"; git clone -q --depth 1 -b "$tag" "$TN_GH/zfs" "$d"
     (
         cd "$d"
@@ -138,21 +153,33 @@ build_zfs() {
         sh autogen.sh
         ./configure --with-linux="$ksrc" --with-linux-obj="$ksrc"
         cp contrib/debian/changelog debian/changelog
-        sed 's/@CFGOPTS@/--enable-debuginfo/g' debian/rules.in > debian/rules
+        local cfgopts=--enable-debuginfo
+        if [ "$FLAVOR" = debug ]; then
+            cfgopts="--enable-debug --enable-debuginfo"
+            sed -i 's/Provides: openzfs-zfs-modules/Provides: openzfs-zfs-modules-dbg/' debian/control.modules.in
+        fi
+        sed "s/@CFGOPTS@/$cfgopts/g" debian/rules.in > debian/rules
         chmod +x debian/rules
         ./scripts/make_gitrev.sh
         debian/rules override_dh_binary-modules
     ) >&2
-    find "$WORK" -maxdepth 2 -name "openzfs-zfs-modules-${kver}_*.deb" -exec mv -t "$out" {} +
-    ls "$out"/openzfs-zfs-modules-*.deb >/dev/null 2>&1 || die "ZFS module package was not produced"
+    find "$WORK/$FLAVOR" -maxdepth 2 -name "openzfs-zfs-modules-${kver}_*.deb" -exec mv -t "$out" {} +
+    ls "$out"/openzfs-zfs-modules-"$kver"_*.deb >/dev/null 2>&1 || die "ZFS module package was not produced"
 }
 
 build_scst() {
-    local tag=$1 kver=$2 out=$3 d="$WORK/scst"
+    local tag=$1 kver=$2 out=$3 d="$WORK/$FLAVOR/scst"
     rm -rf "$d"; git clone -q --depth 1 -b "$tag" "$TN_GH/scst" "$d"
     (
         cd "$d"
         export KVER="$kver" KDIR="/lib/modules/$kver/build"
+        local mode=2perf
+        if [ "$FLAVOR" = debug ]; then
+            # scale-build's scst-dbg: debug modules only, packaged as scst-dbg
+            # (the Makefile switches to scst-dbg.install when KVER is a debug kernel).
+            mode=2debug; export PKG_BUILD_MODE=2debug
+            cat debian/control.dbgmodules > debian/control
+        fi
         sed -i 's/^DEBIAN_REVISION=.*/DEBIAN_REVISION=~truenas+1/g' Makefile
         # SCST's Build-Depends name all four TrueNAS kernel packages (production
         # + debug, image + headers) purely for scale-build's ordering; only the
@@ -162,12 +189,16 @@ build_scst() {
         awk '/^Build-Depends/,/^[A-Z][a-z-]+:/' debian/control | grep -q 'linux-.*-truenas' \
             && die "SCST Build-Depends still names TrueNAS kernel packages"
         make debian/changelog
-        make 2perf
+        make "$mode"
         make scst-dist-gzip
         make dpkg DEBEMAIL=no-reply@localhost DEBFULLNAME=truenas-kernel-patches
     ) >&2
-    find "$d" "$WORK" -maxdepth 3 -name '*.deb' -path '*scst*' ! -name '*-dbg*' ! -name '*dbgsym*' -exec mv -t "$out" {} + || true
-    ls "$out"/*scst*.deb >/dev/null 2>&1 || die "SCST packages were not produced"
+    find "$d" "$WORK/$FLAVOR" -maxdepth 3 -name '*.deb' -path '*scst*' ! -name '*dbgsym*' -exec mv -t "$out" {} + || true
+    if [ "$FLAVOR" = debug ]; then
+        ls "$out"/scst-dbg_*.deb >/dev/null 2>&1 || die "scst-dbg package was not produced"
+    else
+        ls "$out"/scst_*.deb >/dev/null 2>&1 || die "SCST packages were not produced"
+    fi
 }
 
 # --------------------------------------------------------------------------
@@ -217,10 +248,19 @@ download_userspace() {
 # --------------------------------------------------------------------------
 
 write_manifest() {
-    local tag=$1 kver=$2 out=$3
-    python3 - "$tag" "$kver" "$BUNDLE_REV" "$out" <<'PY'
+    local tag=$1 out=$2 f
+    local -A kv=()
+    for f in production debug; do
+        local -a imgs=("$out"/linux-image-truenas-"$f"-amd64_*.deb)
+        [ -f "${imgs[0]}" ] && kv[$f]=$(kernel_release_of "${imgs[0]}")
+    done
+    [ -n "${kv[production]:-}" ] || die "no production kernel package in $out"
+    python3 - "$tag" "${kv[production]}" "${kv[debug]:-}" "$BUNDLE_REV" "$out" <<'PY'
 import hashlib, json, os, subprocess, sys
-tag, kver, rev, out = sys.argv[1:]
+tag, kprod, kdebug, rev, out = sys.argv[1:]
+kernels = {"production": kprod}
+if kdebug:
+    kernels["debug"] = kdebug
 debs = []
 for f in sorted(os.listdir(out)):
     if not f.endswith(".deb"):
@@ -230,52 +270,62 @@ for f in sorted(os.listdir(out)):
     meta = dict(l.split(": ", 1) for l in fields.strip().splitlines())
     debs.append({"file": f, "package": meta["Package"], "version": meta["Version"],
                  "sha256": hashlib.sha256(open(p, "rb").read()).hexdigest()})
-json.dump({"format": 1, "truenas_tag": tag, "truenas_version": tag.removeprefix("TS-"),
-           "kernel_release": kver, "bundle_rev": int(rev), "debs": debs},
+json.dump({"format": 2, "truenas_tag": tag, "truenas_version": tag.removeprefix("TS-"),
+           "kernel_release": kprod, "kernel_releases": kernels,
+           "bundle_rev": int(rev), "debs": debs},
           open(os.path.join(out, "manifest.json"), "w"), indent=2)
 PY
 }
 
-cmd_all() {
-    local tag=$1 dest=$2
+# One kernel flavour: kernel + its ZFS and SCST modules, into $out.
+cmd_kernel() {
+    local tag=$1 out=$2
     [ "$(id -u)" = 0 ] || die "run as root (inside the build container)"
-    mkdir -p "$WORK" "$dest"
-    local out="$WORK/bundle"
+    local w="$WORK/$FLAVOR"
+    mkdir -p "$w" "$out"
 
-    # REUSE_KERNEL=1 keeps kernel .debs from a previous run in $WORK/bundle and
-    # redoes only the later stages (handy when iterating on ZFS/SCST/firmware).
-    if [ "${REUSE_KERNEL:-0}" = 1 ] && ls "$out"/linux-image-truenas-production-*.deb >/dev/null 2>&1; then
-        log "reusing kernel packages from a previous run"
+    # REUSE_KERNEL=1 keeps this flavour's kernel .debs from a previous run in
+    # $out and redoes only the module builds (CI restores them from cache).
+    if [ "${REUSE_KERNEL:-0}" = 1 ] && ls "$out"/linux-image-truenas-"$FLAVOR"-amd64_*.deb >/dev/null 2>&1; then
+        log "[$FLAVOR] reusing kernel packages from a previous run"
         find "$out" -maxdepth 1 -type f ! -name 'linux-*' -delete
     else
         rm -rf "$out"; mkdir -p "$out"
-        log "kernel $tag"
-        rm -rf "$WORK/linux"; mkdir -p "$WORK/linux"
-        git clone -q --depth 1 -b "$tag" "$TN_GH/linux" "$WORK/linux/src"
-        apply_patches "$WORK/linux/src"
-        configure_kernel "$WORK/linux/src"
-        build_kernel "$WORK/linux/src" "$out"
-        rm -rf "$WORK/linux"   # reclaim disk before the module builds
+        log "[$FLAVOR] kernel $tag"
+        rm -rf "$w/linux"; mkdir -p "$w/linux"
+        git clone -q --depth 1 -b "$tag" "$TN_GH/linux" "$w/linux/src"
+        apply_patches "$w/linux/src"
+        configure_kernel "$w/linux/src"
+        build_kernel "$w/linux/src" "$out"
+        rm -rf "$w/linux"   # reclaim disk before the module builds
     fi
 
-    local img kver
-    local -a imgs=("$out"/linux-image-truenas-production-amd64_*.deb)
+    local -a imgs=("$out"/linux-image-truenas-"$FLAVOR"-amd64_*.deb)
     [ -f "${imgs[0]}" ] || die "kernel image package not found in $out"
-    img=${imgs[0]}
-    kver=$(kernel_release_of "$img")
-    log "kernel release $kver"
-    dpkg -i "$out"/linux-headers-truenas-production-*.deb >&2
+    local kver; kver=$(kernel_release_of "${imgs[0]}")
+    log "[$FLAVOR] kernel release $kver"
+    dpkg -i "$out"/linux-headers-truenas-"$FLAVOR"-amd64_*.deb >&2
 
-    log "openzfs $tag";  build_zfs  "$tag" "$kver" "$out"
+    log "[$FLAVOR] openzfs $tag"; build_zfs "$tag" "$kver" "$out"
     if [ "${SKIP_SCST:-0}" = 1 ]; then
-        log "scst skipped (SKIP_SCST=1): do not enable the iSCSI service on this kernel"
+        log "[$FLAVOR] scst skipped (SKIP_SCST=1): do not enable the iSCSI service on this kernel"
     else
-        log "scst $tag";  build_scst "$tag" "$kver" "$out"
+        log "[$FLAVOR] scst $tag"; build_scst "$tag" "$kver" "$out"
     fi
-    log "firmware";      build_firmware_deb "$out"
-    log "userspace";     download_userspace "$out"
+}
 
-    write_manifest "$tag" "$kver" "$out"
+cmd_extras() {
+    local out=$1
+    mkdir -p "$WORK" "$out"
+    log "firmware";  build_firmware_deb "$out"
+    log "userspace"; download_userspace "$out"
+}
+
+cmd_bundle() {
+    local tag=$1 out=$2 dest=$3
+    mkdir -p "$dest"
+    rm -f "$out/manifest.json"
+    write_manifest "$tag" "$out"
     local name="truenas-wifi-${tag}-r${BUNDLE_REV}"
     tar -C "$out" -cf "$dest/$name.tar" .
     (cd "$dest" && sha256sum "$name.tar" > "$name.tar.sha256")
@@ -283,8 +333,23 @@ cmd_all() {
     cat "$out/manifest.json"
 }
 
+cmd_all() {
+    local tag=$1 dest=$2 f
+    local out="$WORK/bundle"
+    mkdir -p "$out"
+    for f in ${FLAVORS:-production debug}; do
+        FLAVOR=$f cmd_kernel "$tag" "$WORK/$f-debs"
+        cp "$WORK/$f-debs"/*.deb "$out"/
+    done
+    cmd_extras "$out"
+    cmd_bundle "$tag" "$out" "$dest"
+}
+
 case ${1:-} in
     all)        shift; cmd_all "$@" ;;
+    kernel)     shift; cmd_kernel "$@" ;;
+    extras)     shift; cmd_extras "$@" ;;
+    bundle)     shift; cmd_bundle "$@" ;;
     configure)  shift; src=$(cd "$1" && pwd); apply_patches "$src"; configure_kernel "$src" ;;
-    *) echo "usage: $0 all <TS-tag> <outdir> | configure <linux-src>" >&2; exit 2 ;;
+    *) echo "usage: $0 all <TS-tag> <outdir> | kernel <TS-tag> <debdir> | extras <debdir> | bundle <TS-tag> <debdir> <outdir> | configure <linux-src>" >&2; exit 2 ;;
 esac

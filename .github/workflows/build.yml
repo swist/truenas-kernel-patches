@@ -1,5 +1,9 @@
 name: build bundle
 
+# One Wi-Fi bundle for one TrueNAS release:
+#   kernel (production)  ┐  in parallel, each: kernel + its ZFS + SCST
+#   kernel (debug)       ┘
+#   bundle               firmware + userspace + manifest, publish release
 on:
   workflow_call:
     inputs:
@@ -8,8 +12,8 @@ on:
       rev:    { type: number, required: true }
   workflow_dispatch:
     inputs:
-      tag:    { description: "TrueNAS tag, e.g. TS-25.10.8", type: string, required: true }
-      debian: { description: "bookworm (25.10) / trixie (26+)", type: string, default: trixie }
+      tag:    { description: "TrueNAS tag, e.g. TS-25.10.7", type: string, required: true }
+      debian: { description: "bookworm (25.10) / trixie (26+)", type: string, default: bookworm }
       rev:    { description: "bundle revision", type: number, default: 1 }
       skip_scst: { description: "skip SCST (only if you never use iSCSI)", type: boolean, default: false }
 
@@ -18,12 +22,16 @@ permissions:
   issues: write
 
 jobs:
-  build:
-    # A full TrueNAS kernel (all modules + debug info + BTF) takes ~3h on a
-    # 4-core hosted runner. Set the repo variable BUILD_RUNNER to e.g.
+  kernel:
+    # A TrueNAS kernel (all modules + debug info + BTF) takes ~2h on a 4-core
+    # hosted runner. Set the repo variable BUILD_RUNNER to e.g.
     # '["self-hosted","linux","x64"]' to use a faster self-hosted machine.
     runs-on: ${{ vars.BUILD_RUNNER && fromJSON(vars.BUILD_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [production, debug]
     steps:
       - uses: actions/checkout@v4
 
@@ -38,49 +46,96 @@ jobs:
         run: |
           work=/mnt/tnwifi
           if ! sudo mkdir -p "$work" 2>/dev/null; then work=$HOME/tnwifi; mkdir -p "$work"; fi
-          sudo mkdir -p "$work/out" "$work/build/bundle" && sudo chmod -R 777 "$work"
+          sudo mkdir -p "$work/debs" "$work/build" && sudo chmod -R 777 "$work"
           echo "WORKDIR=$work" >> "$GITHUB_ENV"
-          echo "OUT=$work/out" >> "$GITHUB_ENV"
 
-      # The kernel is ~2h of the build. Cache its packages so a failure in a
-      # later stage (ZFS/SCST/firmware/publish) retries in minutes. The key
-      # covers everything that changes the kernel; bump "kernel-v1" if the
-      # kernel part of scripts/build.sh changes.
+      # Cache the kernel packages so a failure in the ZFS/SCST/bundle stages
+      # retries in minutes. The key covers everything that changes the kernel;
+      # bump "kernel-v2" if the kernel part of scripts/build.sh changes.
       - name: Restore kernel packages
         id: kcache
         uses: actions/cache/restore@v4
         with:
-          path: ${{ env.WORKDIR }}/build/bundle/linux-*.deb
-          key: kernel-v1-${{ inputs.tag }}-r${{ inputs.rev }}-${{ hashFiles('config/wifi.config', 'patches/**') }}
+          path: ${{ env.WORKDIR }}/debs/linux-*.deb
+          key: kernel-v2-${{ matrix.flavor }}-${{ inputs.tag }}-r${{ inputs.rev }}-${{ hashFiles('config/wifi.config', 'patches/**') }}
 
-      - name: Build in debian:${{ inputs.debian }}
+      - name: Build ${{ matrix.flavor }} kernel + modules in debian:${{ inputs.debian }}
         run: |
           docker run --rm \
+            -e FLAVOR=${{ matrix.flavor }} \
             -e BUNDLE_REV=${{ inputs.rev }} \
             -e SKIP_SCST=${{ inputs.skip_scst && '1' || '0' }} \
             -e REUSE_KERNEL=${{ steps.kcache.outputs.cache-hit == 'true' && '1' || '0' }} \
             -e WORK=/work/build \
             -v "$PWD:/src:ro" -v "$WORKDIR:/work" \
             debian:${{ inputs.debian }} \
-            /src/scripts/ci-container.sh "${{ inputs.tag }}" /work/out 2>&1 | tee build.log
+            /src/scripts/ci-container.sh kernel "${{ inputs.tag }}" /work/debs 2>&1 | tee build.log
           exit "${PIPESTATUS[0]}"
 
       - name: Check for kernel packages
         id: kpk
         if: always()
         run: |
-          if ls "$WORKDIR"/build/bundle/linux-image-truenas-production-amd64_*.deb >/dev/null 2>&1; then
+          if ls "$WORKDIR"/debs/linux-image-truenas-${{ matrix.flavor }}-amd64_*.deb >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"; else echo "exists=false" >> "$GITHUB_OUTPUT"; fi
 
       - name: Save kernel packages
         if: always() && steps.kcache.outputs.cache-hit != 'true' && steps.kpk.outputs.exists == 'true'
         uses: actions/cache/save@v4
         with:
-          path: ${{ env.WORKDIR }}/build/bundle/linux-*.deb
-          key: kernel-v1-${{ inputs.tag }}-r${{ inputs.rev }}-${{ hashFiles('config/wifi.config', 'patches/**') }}
+          path: ${{ env.WORKDIR }}/debs/linux-*.deb
+          key: kernel-v2-${{ matrix.flavor }}-${{ inputs.tag }}-r${{ inputs.rev }}-${{ hashFiles('config/wifi.config', 'patches/**') }}
 
-      - name: List output
-        run: ls -la "$OUT"
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ matrix.flavor }}
+          path: ${{ env.WORKDIR }}/debs/*.deb
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-kernel-${{ matrix.flavor }}
+          path: build.log
+          retention-days: 7
+
+  bundle:
+    needs: kernel
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare work dir
+        run: |
+          work=/mnt/tnwifi
+          if ! sudo mkdir -p "$work" 2>/dev/null; then work=$HOME/tnwifi; mkdir -p "$work"; fi
+          sudo mkdir -p "$work/debs" "$work/out" "$work/build" && sudo chmod -R 777 "$work"
+          echo "WORKDIR=$work" >> "$GITHUB_ENV"
+          echo "OUT=$work/out" >> "$GITHUB_ENV"
+
+      - name: Download kernel packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: debs-*
+          path: ${{ env.WORKDIR }}/debs
+          merge-multiple: true
+
+      - name: Firmware, userspace, manifest in debian:${{ inputs.debian }}
+        run: |
+          ls -la "$WORKDIR/debs"
+          docker run --rm \
+            -e BUNDLE_REV=${{ inputs.rev }} \
+            -e WORK=/work/build \
+            -v "$PWD:/src:ro" -v "$WORKDIR:/work" \
+            debian:${{ inputs.debian }} \
+            bash -c '/src/scripts/ci-container.sh extras /work/debs && /src/scripts/build.sh bundle "$0" /work/debs /work/out' \
+            "${{ inputs.tag }}" 2>&1 | tee build.log
+          exit "${PIPESTATUS[0]}"
 
       - name: Publish release
         env:
@@ -89,9 +144,10 @@ jobs:
           name="truenas-wifi-${{ inputs.tag }}-r${{ inputs.rev }}"
           tar -xOf "$OUT/$name.tar" ./manifest.json > manifest.json
           {
-            echo "Wi-Fi (Intel BE200) kernel bundle for TrueNAS **${{ inputs.tag }}**, revision ${{ inputs.rev }}."
+            echo "Wi-Fi (Intel AX211 / BE200 / BE201) kernel bundle for TrueNAS **${{ inputs.tag }}**, revision ${{ inputs.rev }}."
             echo
-            echo "Kernel release: \`$(jq -r .kernel_release manifest.json)\`"
+            echo "Kernels:"
+            jq -r '.kernel_releases | to_entries[] | "- \(.key): `\(.value)`"' manifest.json
             echo
             echo '| package | version |'; echo '|---|---|'
             jq -r '.debs[] | "| \(.package) | \(.version) |"' manifest.json
@@ -102,20 +158,30 @@ jobs:
             "$OUT/$name.tar" "$OUT/$name.tar.sha256" manifest.json \
             --title "$name" --notes-file notes.md
 
-      - name: Open an issue on failure
+      - name: Upload log
         if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-bundle
+          path: build.log
+          retention-days: 7
+
+  report-failure:
+    needs: [kernel, bundle]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open an issue
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           title="Build failed: ${{ inputs.tag }} r${{ inputs.rev }}"
           if gh issue list --state open --search "\"$title\" in:title" --json number -q '.[0].number' | grep -q .; then exit 0; fi
           {
             echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo
+            echo "Build logs are attached to the run as \`log-*\` artifacts."
             echo "If a patch under \`patches/linux/\` no longer applies, rebase it onto the new tag and push; the watcher rebuilds automatically."
-            echo
-            echo '<details><summary>last 80 log lines</summary>'; echo; echo '```'
-            tail -80 build.log 2>/dev/null || true
-            echo '```'; echo '</details>'
           } > body.md
           gh issue create --title "$title" --body-file body.md

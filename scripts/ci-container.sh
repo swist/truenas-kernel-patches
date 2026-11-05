@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Entry point inside the debian:<release> build container (see build.yml).
-#   ci-container.sh <TS-tag> <outdir>
+#   ci-container.sh <build.sh subcommand> <args...>   e.g. kernel TS-25.10.7 /work/debs
+#   ci-container.sh <TS-tag> <outdir>                 same as "all"
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -14,4 +15,7 @@ apt-get install -y -qq --no-install-recommends \
     autoconf automake libtool gawk uuid-dev libblkid-dev libudev-dev libaio-dev \
     libattr1-dev libtirpc-dev zlib1g-dev quilt dh-python lsb-release lintian >/dev/null
 git config --global --add safe.directory '*'
-exec "$(dirname "$0")/build.sh" all "$@"
+case ${1:-} in
+    TS-*) exec "$(dirname "$0")/build.sh" all "$@" ;;
+    *)    exec "$(dirname "$0")/build.sh" "$@" ;;
+esac
