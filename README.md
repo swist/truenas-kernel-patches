@@ -38,9 +38,11 @@ TrueNAS's `CONFIG_WERROR=y`.
 - `struct net_device` only has its `ieee80211_ptr` member when
   `CONFIG_CFG80211` is enabled, so you can't load Wi-Fi as out-of-tree
   modules on the stock kernel.
-- TrueNAS builds with `CONFIG_MODVERSIONS` off, so modules built for the
-  stock kernel (OpenZFS, SCST) would load into the new one without any ABI
-  check. For that reason they are rebuilt from the same release tag.
+- Enabling Wi-Fi changes `struct net_device`, so modules built for the stock
+  kernel (OpenZFS, SCST) no longer match. On 25.10 (`CONFIG_MODVERSIONS=y`)
+  the new kernel would refuse the stock ZFS module and your pools wouldn't
+  import. On 26.x (`CONFIG_MODVERSIONS` off) it would load them unchecked.
+  Either way they are rebuilt from the same release tag.
 
 ### Why not rebuild the whole TrueNAS image?
 

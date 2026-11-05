@@ -2,9 +2,9 @@
 # Build a "Wi-Fi bundle" for one TrueNAS release:
 #   * the TrueNAS kernel at that release's TS-* tag, with config/wifi.config
 #     merged on top and patches/linux/* applied
-#   * OpenZFS + SCST kernel modules rebuilt against that kernel (TrueNAS's
-#     kernel has CONFIG_MODVERSIONS off and enabling CFG80211 changes
-#     struct net_device, so stock out-of-tree modules must not be reused)
+#   * OpenZFS + SCST kernel modules rebuilt against that kernel (enabling
+#     CFG80211 changes struct net_device; 25.10 has MODVERSIONS on and would
+#     reject the stock modules, 26.x has it off and would load them unchecked)
 #   * iwlwifi firmware for AX211 / BE200 / BE201 only, wireless-regdb, iw, wpa_supplicant
 #
 # Usage (as root, inside a Debian container matching the release, see
