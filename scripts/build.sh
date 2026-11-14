@@ -31,7 +31,9 @@ JOBS=${JOBS:-$(nproc)}
 BUNDLE_REV=${BUNDLE_REV:-1}
 FLAVOR=${FLAVOR:-production}
 case $FLAVOR in production|debug) ;; *) echo "FLAVOR must be production or debug" >&2; exit 2 ;; esac
-LINUX_FIRMWARE_REPO=${LINUX_FIRMWARE_REPO:-https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git}
+# linux-firmware: kernel.org first, then its official GitLab mirror (kernel.org
+# has been unreachable from CI runners). Space-separated; override to pin one.
+LINUX_FIRMWARE_REPOS=${LINUX_FIRMWARE_REPOS:-${LINUX_FIRMWARE_REPO:-https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git https://gitlab.com/kernel-firmware/linux-firmware.git}}
 TN_GH=${TN_GH:-https://github.com/truenas}
 
 log() { printf '\n=== %s\n' "$*" >&2; }
@@ -208,7 +210,17 @@ build_scst() {
 build_firmware_deb() {
     local out=$1 d="$WORK/linux-firmware" stage="$WORK/fw-stage" pkg="$WORK/fw-pkg"
     rm -rf "$d" "$stage" "$pkg"
-    git clone -q --depth 1 "$LINUX_FIRMWARE_REPO" "$d"
+    local repo try ok=0
+    for try in 1 2; do
+        for repo in $LINUX_FIRMWARE_REPOS; do
+            log "linux-firmware from $repo (attempt $try)"
+            rm -rf "$d"
+            if timeout 600 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 \
+                   clone -q --depth 1 "$repo" "$d"; then ok=1; break 2; fi
+        done
+        sleep 30
+    done
+    [ $ok = 1 ] || die "could not download linux-firmware from: $LINUX_FIRMWARE_REPOS"
     local fwver; fwver=$(cd "$d" && git log -1 --format=%cd --date=format:%Y%m%d)
     mkdir -p "$stage"
     (cd "$d" && ./copy-firmware.sh "$stage") >/dev/null
