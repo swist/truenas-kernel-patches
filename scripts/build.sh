@@ -182,7 +182,10 @@ build_scst() {
             mode=2debug; export PKG_BUILD_MODE=2debug
             cat debian/control.dbgmodules > debian/control
         fi
-        sed -i 's/^DEBIAN_REVISION=.*/DEBIAN_REVISION=~truenas+1/g' Makefile
+        # "DEBIAN_REVISION=" before SCST 3.11, "DEBIAN_REVISION :=" since
+        sed -i -E 's/^DEBIAN_REVISION[[:space:]]*[:?]?=.*/DEBIAN_REVISION := ~truenas+1/' Makefile
+        grep -q '^DEBIAN_REVISION := ~truenas+1$' Makefile || die "could not set SCST DEBIAN_REVISION"
+
         # SCST's Build-Depends name all four TrueNAS kernel packages (production
         # + debug, image + headers) purely for scale-build's ordering; only the
         # production headers at $KDIR are actually used. Drop them so debuild's
